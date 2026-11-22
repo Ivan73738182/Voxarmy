@@ -13,22 +13,33 @@ import kotlin.math.hypot
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
-class Soldier(var x: Float, var y: Float, val team: Int) {
+// kind: 0 = солдат, 1 = рабочий
+class Unit2(var x: Float, var y: Float, val team: Int, val kind: Int) {
     var tx = x
     var ty = y
     var selected = false
     var moving = false
+    // состояния рабочего: 0 = свободен, 1 = идёт к шахте, 2 = копает, 3 = несёт в замок
+    var job = 0
+    var timer = 0f
+    var carrying = false
 }
 
 class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback, Runnable {
     private var thread: Thread? = null
     @Volatile private var running = false
     private val paint = Paint().apply { isFilterBitmap = false; isAntiAlias = false; isDither = false }
-    private val selPaint = Paint().apply {
-        style = Paint.Style.STROKE; color = Color.rgb(80, 255, 80); isAntiAlias = false
+    private val selPaint = Paint().apply { style = Paint.Style.STROKE; color = Color.rgb(80, 255, 80) }
+    private val tgtPaint = Paint().apply { style = Paint.Style.STROKE; color = Color.rgb(255, 230, 80) }
+    private val goldDot = Paint().apply { color = Color.rgb(250, 215, 70) }
+    private val hudBg = Paint().apply { color = Color.argb(170, 20, 20, 30) }
+    private val hudText = Paint().apply {
+        color = Color.WHITE; textSize = 40f; isAntiAlias = true; typeface = Typeface.DEFAULT_BOLD
     }
-    private val tgtPaint = Paint().apply {
-        style = Paint.Style.STROKE; color = Color.rgb(255, 230, 80); isAntiAlias = false
+    private val btnPaint = Paint().apply { color = Color.rgb(60, 70, 110) }
+    private val btnOff = Paint().apply { color = Color.rgb(70, 70, 70) }
+    private val btnText = Paint().apply {
+        color = Color.WHITE; textSize = 34f; isAntiAlias = true; textAlign = Paint.Align.CENTER
     }
 
     private fun load(name: String): Bitmap =
@@ -42,6 +53,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val castleRed = load("castle_red.png")
     private val footBlue = load("footman_blue.png")
     private val footRed = load("footman_red.png")
+    private val workBlue = load("worker_blue.png")
+    private val workRed = load("worker_red.png")
+    private val mine = load("goldmine.png")
 
     private val mapW = 48
     private val mapH = 48
@@ -49,9 +63,21 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val speed = 40f
     private val ground = Array(mapH) { IntArray(mapW) }
     private val trees = Array(mapH) { BooleanArray(mapW) }
-    private val soldiers = CopyOnWriteArrayList<Soldier>()
+    private val units = CopyOnWriteArrayList<Unit2>()
 
-    // камера в экранных пикселях, zoom = пикселей экрана на 1 пиксель спрайта
+    // постройки (левый верхний угол в мировых пикселях)
+    private val castleX = 6f * tile
+    private val castleY = 6f * tile
+    private val mineX = 15f * tile
+    private val mineY = 6f * tile
+    private val castleRX = 40f * tile
+    private val castleRY = 40f * tile
+
+    @Volatile private var gold = 150
+    private var menuOpen = false
+    private var msg = ""
+    private var msgTime = 0f
+
     @Volatile private var zoom = 6f
     private var minZoom = 2f
     private val maxZoom = 16f
@@ -69,6 +95,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private var downY = 0f
     private var dragging = false
     private val dst = RectF()
+
+    // кнопки меню (экранные координаты, считаются в drawFrame)
+    private val btnWorker = RectF()
+    private val btnSoldier = RectF()
 
     private val scaleDetector = ScaleGestureDetector(context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -101,12 +131,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             ground[y][x] = 4
             trees[y][x] = false
         }
-        for (y in 4..12) for (x in 4..12) trees[y][x] = false
+        for (y in 4..12) for (x in 4..18) trees[y][x] = false
         for (y in 34..44) for (x in 34..44) trees[y][x] = false
-        for (i in 0..3) {
-            soldiers.add(Soldier((9 + i) * tile.toFloat(), 9f * tile, 0))
-            soldiers.add(Soldier((36 - i) * tile.toFloat(), 38f * tile, 1))
-        }
+        for (i in 0..2) units.add(Unit2((9 + i) * tile.toFloat(), 10f * tile, 0, 0))
+        for (i in 0..1) units.add(Unit2((9 + i) * tile.toFloat(), 12f * tile, 0, 1))
+        for (i in 0..3) units.add(Unit2((36 - i) * tile.toFloat(), 38f * tile, 1, 0))
     }
 
     fun resume() {
@@ -135,8 +164,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
     }
 
+    private fun moveTo(u: Unit2, x: Float, y: Float) {
+        u.tx = x; u.ty = y; u.moving = true
+    }
+
     private fun update(dt: Float) {
-        // инерция камеры
+        if (msgTime > 0f) msgTime -= dt
         if (camVx != 0f || camVy != 0f) {
             camX += camVx * dt
             camY += camVy * dt
@@ -146,17 +179,39 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             if (hypot(camVx, camVy) < 15f) { camVx = 0f; camVy = 0f }
             clampCamera()
         }
-        for (s in soldiers) {
-            if (!s.moving) continue
-            val dx = s.tx - s.x
-            val dy = s.ty - s.y
-            val d = hypot(dx, dy)
-            val step = speed * dt
-            if (d <= step) {
-                s.x = s.tx; s.y = s.ty; s.moving = false
-            } else {
-                s.x += dx / d * step
-                s.y += dy / d * step
+        for (u in units) {
+            if (u.moving) {
+                val dx = u.tx - u.x
+                val dy = u.ty - u.y
+                val d = hypot(dx, dy)
+                val step = speed * dt
+                if (d <= step) {
+                    u.x = u.tx; u.y = u.ty; u.moving = false
+                } else {
+                    u.x += dx / d * step
+                    u.y += dy / d * step
+                }
+            }
+            if (u.kind == 1 && u.team == 0) updateWorker(u, dt)
+        }
+    }
+
+    private fun updateWorker(u: Unit2, dt: Float) {
+        when (u.job) {
+            1 -> if (!u.moving) { u.job = 2; u.timer = 3f }
+            2 -> {
+                u.timer -= dt
+                if (u.timer <= 0f) {
+                    u.carrying = true
+                    u.job = 3
+                    moveTo(u, castleX + 8f, castleY + 24f)
+                }
+            }
+            3 -> if (!u.moving) {
+                gold += 10
+                u.carrying = false
+                u.job = 1
+                moveTo(u, mineX + 8f, mineY + 24f)
             }
         }
     }
@@ -192,18 +247,50 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         for (ty in y0..y1) for (tx in x0..x1) {
             if (trees[ty][tx]) c.drawBitmap(tree, (tx * tile).toFloat(), (ty * tile).toFloat(), paint)
         }
-        c.drawBitmap(castleBlue, 6f * tile, 6f * tile, paint)
-        c.drawBitmap(castleRed, 40f * tile, 40f * tile, paint)
-        for (s in soldiers) {
-            if (s.selected && s.moving) ring(c, tgtPaint, s.tx + 8, s.ty + 14, 3f, 1.5f)
+        c.drawBitmap(mine, mineX, mineY, paint)
+        c.drawBitmap(castleBlue, castleX, castleY, paint)
+        c.drawBitmap(castleRed, castleRX, castleRY, paint)
+        if (menuOpen) ring(c, tgtPaint, castleX + 16, castleY + 28, 18f, 6f)
+
+        for (u in units) {
+            if (u.selected && u.moving && u.job == 0) ring(c, tgtPaint, u.tx + 8, u.ty + 14, 3f, 1.5f)
         }
-        for (s in soldiers.sortedBy { it.y }) {
-            val sx = s.x.roundToInt().toFloat()
-            val sy = s.y.roundToInt().toFloat()
-            if (s.selected) ring(c, selPaint, sx + 8, sy + 14, 7f, 3f)
-            c.drawBitmap(if (s.team == 0) footBlue else footRed, sx, sy, paint)
+        for (u in units.sortedBy { it.y }) {
+            val sx = u.x.roundToInt().toFloat()
+            val sy = u.y.roundToInt().toFloat()
+            if (u.selected) ring(c, selPaint, sx + 8, sy + 14, 7f, 3f)
+            val bmp = if (u.kind == 1) (if (u.team == 0) workBlue else workRed)
+                      else (if (u.team == 0) footBlue else footRed)
+            c.drawBitmap(bmp, sx, sy, paint)
+            if (u.carrying) c.drawRect(sx + 6, sy - 2, sx + 10, sy + 2, goldDot)
         }
         c.restore()
+        drawHud(c)
+    }
+
+    private fun drawHud(c: Canvas) {
+        c.drawRect(0f, 0f, 330f, 70f, hudBg)
+        c.drawCircle(36f, 35f, 14f, goldDot)
+        c.drawText("$gold", 66f, 49f, hudText)
+        if (msgTime > 0f) {
+            hudText.textAlign = Paint.Align.CENTER
+            c.drawText(msg, width / 2f, 110f, hudText)
+            hudText.textAlign = Paint.Align.LEFT
+        }
+        if (menuOpen) {
+            val bw = 330f
+            val bh = 110f
+            val top = height - bh - 24f
+            val left = width / 2f - bw - 12f
+            btnWorker.set(left, top, left + bw, top + bh)
+            btnSoldier.set(left + bw + 24f, top, left + bw * 2 + 24f, top + bh)
+            c.drawRoundRect(btnWorker, 16f, 16f, if (gold >= 50) btnPaint else btnOff)
+            c.drawRoundRect(btnSoldier, 16f, 16f, if (gold >= 80) btnPaint else btnOff)
+            c.drawText("Рабочий", btnWorker.centerX(), top + 46f, btnText)
+            c.drawText("50 золота", btnWorker.centerX(), top + 90f, btnText)
+            c.drawText("Солдат", btnSoldier.centerX(), top + 46f, btnText)
+            c.drawText("80 золота", btnSoldier.centerX(), top + 90f, btnText)
+        }
     }
 
     private fun clampCamera() {
@@ -213,25 +300,61 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         camY = camY.coerceIn(0f, maxY)
     }
 
+    private fun say(t: String) { msg = t; msgTime = 2f }
+
+    private fun train(kind: Int, cost: Int) {
+        if (gold < cost) { say("Не хватает золота"); return }
+        gold -= cost
+        val n = units.count { it.team == 0 }
+        val u = Unit2(castleX + 8f + (n % 5) * 4f, castleY + 34f, 0, kind)
+        units.add(u)
+        moveTo(u, castleX + 4f + (n % 6) * 12f, castleY + 50f + ((n / 6) % 3) * 16f)
+    }
+
     private fun handleTap(sx: Float, sy: Float) {
+        if (menuOpen) {
+            if (btnWorker.contains(sx, sy)) { train(1, 50); return }
+            if (btnSoldier.contains(sx, sy)) { train(0, 80); return }
+        }
         val wx = (sx + camX) / zoom
         val wy = (sy + camY) / zoom
-        val hit = soldiers.lastOrNull {
+
+        // тап по юниту
+        val hit = units.lastOrNull {
             it.team == 0 && wx >= it.x && wx <= it.x + 16 && wy >= it.y && wy <= it.y + 16
         }
         if (hit != null) {
             hit.selected = !hit.selected
+            if (hit.selected) { hit.job = 0 }
+            menuOpen = false
             return
         }
-        val sel = soldiers.filter { it.selected }
+        // тап по замку
+        if (wx >= castleX && wx <= castleX + 32 && wy >= castleY && wy <= castleY + 32) {
+            menuOpen = !menuOpen
+            return
+        }
+        menuOpen = false
+        val sel = units.filter { it.selected }
+        // тап по шахте: выделенные рабочие идут копать
+        if (wx >= mineX && wx <= mineX + 32 && wy >= mineY && wy <= mineY + 32) {
+            var any = false
+            for (u in sel) if (u.kind == 1) {
+                u.job = 1; u.carrying = false
+                moveTo(u, mineX + 8f + (any.compareTo(false) * 0) , mineY + 24f)
+                any = true
+            }
+            if (any) return
+        }
         val maxW = mapW * tile - 16f
         val maxH = mapH * tile - 16f
-        for ((i, s) in sel.withIndex()) {
+        for ((i, u) in sel.withIndex()) {
             val col = i % 4
             val row = i / 4
-            s.tx = (wx - 8f + (col - 1.5f) * 18f).coerceIn(0f, maxW)
-            s.ty = (wy - 14f + row * 18f).coerceIn(0f, maxH)
-            s.moving = true
+            u.job = 0; u.carrying = false
+            moveTo(u,
+                (wx - 8f + (col - 1.5f) * 18f).coerceIn(0f, maxW),
+                (wy - 14f + row * 18f).coerceIn(0f, maxH))
         }
     }
 
