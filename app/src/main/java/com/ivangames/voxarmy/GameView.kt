@@ -6,11 +6,26 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import java.util.Random
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.hypot
+
+class Soldier(var x: Float, var y: Float, val team: Int) {
+    var tx = x
+    var ty = y
+    var selected = false
+    var moving = false
+}
 
 class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback, Runnable {
     private var thread: Thread? = null
     @Volatile private var running = false
     private val paint = Paint().apply { isFilterBitmap = false; isAntiAlias = false }
+    private val selPaint = Paint().apply {
+        style = Paint.Style.STROKE; strokeWidth = 3f; color = Color.rgb(80, 255, 80)
+    }
+    private val tgtPaint = Paint().apply {
+        style = Paint.Style.STROKE; strokeWidth = 3f; color = Color.rgb(255, 230, 80)
+    }
 
     private fun load(name: String): Bitmap =
         context.assets.open("sprites/$name").use { BitmapFactory.decodeStream(it) }
@@ -28,13 +43,18 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val mapH = 48
     private val tile = 16
     private val scale = 6f
+    private val speed = 40f
     private val ground = Array(mapH) { IntArray(mapW) }
     private val trees = Array(mapH) { BooleanArray(mapW) }
+    private val soldiers = CopyOnWriteArrayList<Soldier>()
 
     private var camX = 3f * tile * scale
     private var camY = 3f * tile * scale
     private var lastX = 0f
     private var lastY = 0f
+    private var downX = 0f
+    private var downY = 0f
+    private var dragging = false
     private val dst = RectF()
 
     init {
@@ -51,6 +71,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
         for (y in 4..12) for (x in 4..12) trees[y][x] = false
         for (y in 34..44) for (x in 34..44) trees[y][x] = false
+        for (i in 0..3) {
+            soldiers.add(Soldier((9 + i) * tile.toFloat(), 9f * tile, 0))
+            soldiers.add(Soldier((36 - i) * tile.toFloat(), 38f * tile, 1))
+        }
     }
 
     fun resume() {
@@ -65,12 +89,33 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     }
 
     override fun run() {
+        var last = System.nanoTime()
         while (running) {
             val h = holder
             if (!h.surface.isValid) { Thread.sleep(10); continue }
+            val now = System.nanoTime()
+            val dt = ((now - last) / 1_000_000_000f).coerceAtMost(0.05f)
+            last = now
+            update(dt)
             val c = h.lockCanvas() ?: continue
             try { drawFrame(c) } finally { h.unlockCanvasAndPost(c) }
-            Thread.sleep(16)
+            Thread.sleep(8)
+        }
+    }
+
+    private fun update(dt: Float) {
+        for (s in soldiers) {
+            if (!s.moving) continue
+            val dx = s.tx - s.x
+            val dy = s.ty - s.y
+            val d = hypot(dx, dy)
+            val step = speed * dt
+            if (d <= step) {
+                s.x = s.tx; s.y = s.ty; s.moving = false
+            } else {
+                s.x += dx / d * step
+                s.y += dy / d * step
+            }
         }
     }
 
@@ -79,6 +124,13 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         val t = wy * scale - camY
         dst.set(l, t, l + b.width * scale, t + b.height * scale)
         c.drawBitmap(b, null, dst, paint)
+    }
+
+    private fun ring(c: Canvas, p: Paint, wx: Float, wy: Float, rx: Float, ry: Float) {
+        val cx = wx * scale - camX
+        val cy = wy * scale - camY
+        dst.set(cx - rx * scale, cy - ry * scale, cx + rx * scale, cy + ry * scale)
+        c.drawOval(dst, p)
     }
 
     private fun drawFrame(c: Canvas) {
@@ -101,9 +153,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
         drawBmp(c, castleBlue, 6f * tile, 6f * tile)
         drawBmp(c, castleRed, 40f * tile, 40f * tile)
-        for (i in 0..3) {
-            drawBmp(c, footBlue, (9 + i) * tile.toFloat(), 9f * tile)
-            drawBmp(c, footRed, (36 - i) * tile.toFloat(), 38f * tile)
+        for (s in soldiers) {
+            if (s.selected && s.moving) ring(c, tgtPaint, s.tx + 8, s.ty + 14, 3f, 1.5f)
+        }
+        for (s in soldiers.sortedBy { it.y }) {
+            if (s.selected) ring(c, selPaint, s.x + 8, s.y + 14, 7f, 3f)
+            drawBmp(c, if (s.team == 0) footBlue else footRed, s.x, s.y)
         }
     }
 
@@ -114,15 +169,47 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         camY = camY.coerceIn(0f, maxY)
     }
 
+    private fun handleTap(sx: Float, sy: Float) {
+        val wx = (sx + camX) / scale
+        val wy = (sy + camY) / scale
+        val hit = soldiers.lastOrNull {
+            it.team == 0 && wx >= it.x && wx <= it.x + 16 && wy >= it.y && wy <= it.y + 16
+        }
+        if (hit != null) {
+            hit.selected = !hit.selected
+            return
+        }
+        val sel = soldiers.filter { it.selected }
+        val maxW = mapW * tile - 16f
+        val maxH = mapH * tile - 16f
+        for ((i, s) in sel.withIndex()) {
+            val col = i % 4
+            val row = i / 4
+            s.tx = (wx - 8f + (col - 1.5f) * 18f).coerceIn(0f, maxW)
+            s.ty = (wy - 14f + row * 18f).coerceIn(0f, maxH)
+            s.moving = true
+        }
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.action) {
-            MotionEvent.ACTION_DOWN -> { lastX = e.x; lastY = e.y }
+            MotionEvent.ACTION_DOWN -> {
+                lastX = e.x; lastY = e.y
+                downX = e.x; downY = e.y
+                dragging = false
+            }
             MotionEvent.ACTION_MOVE -> {
-                camX -= e.x - lastX
-                camY -= e.y - lastY
+                if (!dragging && hypot(e.x - downX, e.y - downY) > 25f) dragging = true
+                if (dragging) {
+                    camX -= e.x - lastX
+                    camY -= e.y - lastY
+                    clampCamera()
+                }
                 lastX = e.x
                 lastY = e.y
-                clampCamera()
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!dragging) handleTap(e.x, e.y)
             }
         }
         return true
