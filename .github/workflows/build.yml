@@ -12,7 +12,14 @@ jobs:
       - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.2
-      - run: gradle assembleDebug
+      - name: Build with retry
+        run: |
+          for i in 1 2 3; do
+            gradle assembleDebug && exit 0
+            echo "Попытка $i не удалась, ждём 60 секунд"
+            sleep 60
+          done
+          exit 1
       - uses: actions/upload-artifact@v4
         with:
           name: Voxarmy-debug
