@@ -93,6 +93,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val castleRed = load("castle_red.png")
     private val footBlue = load("footman_blue.png")
     private val footRed = load("footman_red.png")
+    private val workBlue = load("worker_blue.png")
     private val workRed = load("worker_red.png")
     private val mine = load("goldmine.png")
 
