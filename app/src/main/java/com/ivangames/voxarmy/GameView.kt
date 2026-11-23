@@ -35,6 +35,9 @@ class Unit2(var x: Float, var y: Float, val team: Int, val kind: Int) {
     var goalY = 0f
     val path = ArrayList<Float>()
     var pi = 0
+    var stuckT = 0f
+    var lastPx = 0f
+    var lastPy = 0f
     val moving: Boolean get() = pi * 2 < path.size
 }
 
@@ -420,21 +423,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         updateAi(dt)
         for (u in units) {
             if (u.hitTimer > 0f) u.hitTimer -= dt
-            if (u.moving) {
-                val tx = u.path[u.pi * 2]
-                val ty = u.path[u.pi * 2 + 1]
-                val dx = tx - u.x
-                val dy = ty - u.y
-                val d = hypot(dx, dy)
-                val step = speed * dt
-                if (d <= step) {
-                    u.x = tx; u.y = ty; u.pi++
-                } else {
-                    u.x += dx / d * step
-                    u.y += dy / d * step
-                }
-                if (!u.moving) { u.path.clear(); u.pi = 0 }
-            }
+            moveUnit(u, dt)
             if (u.kind == 1) updateWorker(u, dt) else updateSoldier(u, dt)
         }
         separate()
@@ -1136,6 +1125,71 @@ if (u.cd <= 0f) {
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {}
+
+    private fun tryMove(u: Unit2, mx: Float, my: Float) {
+        val nx = u.x + mx
+        val ny = u.y + my
+        if (!blockedBox(nx + 8f, ny + 8f, 5f)) { u.x = nx; u.y = ny; return }
+        if (!blockedBox(nx + 8f, u.y + 8f, 5f)) { u.x = nx; return }
+        if (!blockedBox(u.x + 8f, ny + 8f, 5f)) { u.y = ny }
+    }
+
+    private fun moveUnit(u: Unit2, dt: Float) {
+        if (!u.moving) { u.stuckT = 0f; return }
+        val tx = u.path[u.pi * 2]
+        val ty = u.path[u.pi * 2 + 1]
+        val ddx = tx - u.x
+        val ddy = ty - u.y
+        val d = hypot(ddx, ddy)
+        val step = speed * dt
+        val isLast = u.pi * 2 + 2 >= u.path.size
+        if (d <= step || (!isLast && d < 3f)) {
+            u.x = tx
+            u.y = ty
+            u.pi++
+            if (!u.moving) { u.path.clear(); u.pi = 0 }
+            u.stuckT = 0f
+            u.lastPx = u.x
+            u.lastPy = u.y
+            return
+        }
+        val dx = ddx / d
+        val dy = ddy / d
+        var ax = 0f
+        var ay = 0f
+        for (o in units) {
+            if (o === u || o.hp <= 0) continue
+            val ox = o.x - u.x
+            val oy = o.y - u.y
+            val od = hypot(ox, oy)
+            if (od > 22f || od < 0.01f) continue
+            val dot = (ox * dx + oy * dy) / od
+            if (dot < 0.2f) continue
+            val cross = dx * oy - dy * ox
+            val sx: Float
+            val sy: Float
+            if (cross < -2f) { sx = -dy; sy = dx } else { sx = dy; sy = -dx }
+            val w = (22f - od) / 22f * dot * 1.6f
+            ax += sx * w
+            ay += sy * w
+        }
+        var fx = dx + ax
+        var fy = dy + ay
+        val fl = hypot(fx, fy)
+        if (fl > 0.01f) { fx /= fl; fy /= fl } else { fx = dx; fy = dy }
+        tryMove(u, fx * step, fy * step)
+        u.stuckT += dt
+        if (u.stuckT >= 0.5f) {
+            val moved = hypot(u.x - u.lastPx, u.y - u.lastPy)
+            u.lastPx = u.x
+            u.lastPy = u.y
+            u.stuckT = 0f
+            if (moved < 5f) {
+                if (hypot(u.goalX - u.x, u.goalY - u.y) < 40f) stop(u)
+                else moveTo(u, u.goalX, u.goalY)
+            }
+        }
+    }
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
         minZoom = maxOf(w.toFloat() / (mapW * tile), h.toFloat() / (mapH * tile))
         zoom = zoom.coerceIn(minZoom, maxZoom)
