@@ -29,6 +29,7 @@ class Unit2(var x: Float, var y: Float, val team: Int, val kind: Int) {
     var hitTimer = 0f
     var tgtUnit: Unit2? = null
     var tgtCastle = -1
+    var tgtOre: Ore? = null
     var autoT = false
     var repath = 0f
     var goalX = 0f
@@ -39,6 +40,11 @@ class Unit2(var x: Float, var y: Float, val team: Int, val kind: Int) {
     var lastPx = 0f
     var lastPy = 0f
     val moving: Boolean get() = pi * 2 < path.size
+}
+
+class Ore(val tx: Int, val ty: Int, var amount: Int) {
+    val x: Float get() = tx * 16f
+    val y: Float get() = ty * 16f
 }
 
 class Castle(val x: Float, val y: Float, val team: Int) {
@@ -52,6 +58,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     private var thread: Thread? = null
     @Volatile private var running = false
+    private val sfx = Sfx(context)
+    private val prefs = context.getSharedPreferences("voxarmy", Context.MODE_PRIVATE)
+    @Volatile private var hasSave = prefs.getString("save", null) != null
+    @Volatile private var gameActive = false
 
     // ---------- краски ----------
     private val paint = Paint().apply { isFilterBitmap = false; isAntiAlias = false; isDither = false }
@@ -98,7 +108,7 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val footRed = load("footman_red.png")
     private val workBlue = load("worker_blue.png")
     private val workRed = load("worker_red.png")
-    private val mine = load("goldmine.png")
+    private val oreBmp = load("ore.png")
 
     // ---------- карта ----------
     private val mapW = 48
@@ -109,13 +119,18 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private val trees = Array(mapH) { BooleanArray(mapW) }
     private val blocked = BooleanArray(mapW * mapH)
     private val units = CopyOnWriteArrayList<Unit2>()
+    private val ores = CopyOnWriteArrayList<Ore>()
 
     private val castles = arrayOf(
         Castle(6f * tile, 6f * tile, 0),
         Castle(40f * tile, 40f * tile, 1)
     )
-    private val mineXs = floatArrayOf(15f * tile, 31f * tile)
-    private val mineYs = floatArrayOf(6f * tile, 40f * tile)
+    private val oreSpots = arrayOf(
+        intArrayOf(13, 8), intArrayOf(14, 11), intArrayOf(8, 15), intArrayOf(15, 13),
+        intArrayOf(33, 37), intArrayOf(34, 34), intArrayOf(38, 34), intArrayOf(31, 41),
+        intArrayOf(24, 22), intArrayOf(20, 23), intArrayOf(28, 24), intArrayOf(16, 21),
+        intArrayOf(32, 22), intArrayOf(24, 16), intArrayOf(24, 32), intArrayOf(18, 28)
+    )
 
     // ---------- состояние ----------
     private val gold = intArrayOf(150, 150)
@@ -131,6 +146,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     private var waveSize = 5
     private var menuT = 0f
     private var skyH = -1
+    private var markX = 0f
+    private var markY = 0f
     private val actions = ConcurrentLinkedQueue<() -> Unit>()
 
     // ---------- камера ----------
@@ -157,8 +174,10 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
     // кнопки (экранные координаты)
     private val btnWorker = RectF()
     private val btnSoldier = RectF()
-    private val btnHud = Array(3) { RectF() }
-    private val menuBtns = Array(3) { RectF() }
+    private val btnHud = Array(4) { RectF() }
+    private val menuBtns = Array(4) { RectF() }
+    private val menuIds = IntArray(4)
+    private var menuCount = 3
     private val backBtn = RectF()
 
     private val starX = FloatArray(60)
@@ -166,6 +185,9 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
 
     init {
         holder.addCallback(this)
+        sfx.enabled = prefs.getBoolean("sound", true)
+        sfx.init()
+        sfx.startMusic()
         val rr = Random(7)
         for (i in 0 until 60) { starX[i] = rr.nextFloat(); starY[i] = rr.nextFloat() }
         val rnd = Random(42)
@@ -184,7 +206,6 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             blocked[y * mapW + x] = ground[y][x] == 3 || trees[y][x]
         }
         for (c in castles) block(c.x, c.y)
-        for (i in 0..1) block(mineXs[i], mineYs[i])
     }
 
     private fun block(px: Float, py: Float) {
@@ -193,13 +214,30 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         for (dy in 0..1) for (dx in 0..1) blocked[(ty + dy) * mapW + tx + dx] = true
     }
 
+    // ================= СТАРТ / СОХРАНЕНИЕ =================
+
     private fun startGame() {
         newGame()
+        gameActive = true
         zoom = 6f.coerceIn(minZoom, maxZoom)
         camX = (castles[0].x + 16f) * zoom - width / 2f
         camY = (castles[0].y + 16f) * zoom - height / 2f
         clampCamera()
         screenState = 1
+    }
+
+    private fun continueGame() {
+        if (!gameActive) {
+            if (loadGame()) gameActive = true else { startGame(); return }
+        }
+        screenState = 1
+    }
+
+    private fun endGameToMenu() {
+        gameActive = false
+        hasSave = false
+        prefs.edit().remove("save").apply()
+        screenState = 0
     }
 
     private fun newGame() {
@@ -212,19 +250,91 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         menuOpen = false
         rectMode = false
         selecting = false
+        for (o in ores) blocked[idx(o.tx, o.ty)] = false
+        ores.clear()
+        for (s in oreSpots) {
+            trees[s[1]][s[0]] = false
+            blocked[idx(s[0], s[1])] = true
+            ores.add(Ore(s[0], s[1], 150))
+        }
         for (i in 0..2) units.add(Unit2((9 + i) * tile.toFloat(), 10f * tile, 0, 0))
         for (i in 0..1) units.add(Unit2((9 + i) * tile.toFloat(), 12f * tile, 0, 1))
         for (i in 0..1) units.add(Unit2((36 - i) * tile.toFloat(), 38f * tile, 1, 0))
         for (i in 0..1) {
             val w = Unit2((36 + i) * tile.toFloat(), 42f * tile, 1, 1)
-            w.job = 1
-            moveTo(w, mineXs[1] + 8f, mineYs[1] + 24f)
             units.add(w)
+            val o = nearestOre(w)
+            if (o != null) { w.job = 1; moveToOre(w, o) }
         }
         state = 0
     }
 
+    private fun saveGame() {
+        if (!gameActive || state != 0) return
+        val sb = StringBuilder()
+        sb.append("G ${gold[0]} ${gold[1]} ${castles[0].hp} ${castles[1].hp} $waveSize $camX $camY $zoom\n")
+        for (u in units) {
+            sb.append("U ${u.team} ${u.kind} ${u.x} ${u.y} ${u.hp} ${u.job} ${if (u.carrying) 1 else 0} ${u.timer}\n")
+        }
+        for (o in ores) sb.append("O ${o.tx} ${o.ty} ${o.amount}\n")
+        prefs.edit().putString("save", sb.toString()).apply()
+        hasSave = true
+    }
+
+    private fun loadGame(): Boolean {
+        val s = prefs.getString("save", null) ?: return false
+        try {
+            units.clear()
+            for (o in ores) blocked[idx(o.tx, o.ty)] = false
+            ores.clear()
+            for (line in s.split("\n")) {
+                if (line.isBlank()) continue
+                val p = line.trim().split(" ")
+                when (p[0]) {
+                    "G" -> {
+                        gold[0] = p[1].toInt(); gold[1] = p[2].toInt()
+                        castles[0].hp = p[3].toInt(); castles[1].hp = p[4].toInt()
+                        waveSize = p[5].toInt()
+                        camX = p[6].toFloat(); camY = p[7].toFloat(); zoom = p[8].toFloat()
+                    }
+                    "U" -> {
+                        val u = Unit2(p[3].toFloat(), p[4].toFloat(), p[1].toInt(), p[2].toInt())
+                        u.hp = p[5].toInt()
+                        u.job = p[6].toInt()
+                        u.carrying = p[7] == "1"
+                        u.timer = p[8].toFloat()
+                        units.add(u)
+                    }
+                    "O" -> {
+                        val o = Ore(p[1].toInt(), p[2].toInt(), p[3].toInt())
+                        ores.add(o)
+                        blocked[idx(o.tx, o.ty)] = true
+                    }
+                }
+            }
+            for (u in units) {
+                if (u.kind != 1) continue
+                if (u.job == 1) {
+                    val o = nearestOre(u)
+                    if (o != null) moveToOre(u, o) else u.job = 0
+                } else if (u.job == 3) {
+                    moveTo(u, castles[u.team].x + 8f, castles[u.team].y + 24f)
+                }
+            }
+            state = 0
+            menuOpen = false
+            rectMode = false
+            selecting = false
+            zoom = zoom.coerceIn(minZoom, maxZoom)
+            clampCamera()
+            return true
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
     fun resume() {
+        sfx.onResume()
         running = true
         thread = Thread(this).also { it.start() }
     }
@@ -233,6 +343,8 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         running = false
         thread?.join()
         thread = null
+        saveGame()
+        sfx.onPause()
     }
 
     override fun run() {
@@ -355,6 +467,11 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
     }
 
+    private fun moveToOre(u: Unit2, o: Ore) {
+        u.tgtOre = o
+        moveTo(u, o.x, o.y)
+    }
+
     private fun stop(u: Unit2) {
         u.path.clear()
         u.pi = 0
@@ -400,7 +517,78 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         }
     }
 
+    private fun tryMove(u: Unit2, mx: Float, my: Float) {
+        val nx = u.x + mx
+        val ny = u.y + my
+        if (!blockedBox(nx + 8f, ny + 8f, 5f)) { u.x = nx; u.y = ny; return }
+        if (!blockedBox(nx + 8f, u.y + 8f, 5f)) { u.x = nx; return }
+        if (!blockedBox(u.x + 8f, ny + 8f, 5f)) { u.y = ny }
+    }
+
+    private fun moveUnit(u: Unit2, dt: Float) {
+        if (!u.moving) { u.stuckT = 0f; return }
+        val tx = u.path[u.pi * 2]
+        val ty = u.path[u.pi * 2 + 1]
+        val ddx = tx - u.x
+        val ddy = ty - u.y
+        val d = hypot(ddx, ddy)
+        val step = speed * dt
+        val isLast = u.pi * 2 + 2 >= u.path.size
+        if (d <= step || (!isLast && d < 3f)) {
+            u.x = tx
+            u.y = ty
+            u.pi++
+            if (!u.moving) { u.path.clear(); u.pi = 0 }
+            u.stuckT = 0f
+            u.lastPx = u.x
+            u.lastPy = u.y
+            return
+        }
+        val dx = ddx / d
+        val dy = ddy / d
+        var ax = 0f
+        var ay = 0f
+        for (o in units) {
+            if (o === u || o.hp <= 0) continue
+            val ox = o.x - u.x
+            val oy = o.y - u.y
+            val od = hypot(ox, oy)
+            if (od > 22f || od < 0.01f) continue
+            val dot = (ox * dx + oy * dy) / od
+            if (dot < 0.2f) continue
+            val cross = dx * oy - dy * ox
+            val sx: Float
+            val sy: Float
+            if (cross < -2f) { sx = -dy; sy = dx } else { sx = dy; sy = -dx }
+            val w = (22f - od) / 22f * dot * 1.6f
+            ax += sx * w
+            ay += sy * w
+        }
+        var fx = dx + ax
+        var fy = dy + ay
+        val fl = hypot(fx, fy)
+        if (fl > 0.01f) { fx /= fl; fy /= fl } else { fx = dx; fy = dy }
+        tryMove(u, fx * step, fy * step)
+        u.stuckT += dt
+        if (u.stuckT >= 0.5f) {
+            val moved = hypot(u.x - u.lastPx, u.y - u.lastPy)
+            u.lastPx = u.x
+            u.lastPy = u.y
+            u.stuckT = 0f
+            if (moved < 5f) {
+                if (hypot(u.goalX - u.x, u.goalY - u.y) < 40f) stop(u)
+                else moveTo(u, u.goalX, u.goalY)
+            }
+        }
+    }
+
     // ================= ЛОГИКА =================
+
+    private fun sfxAt(name: String, x: Float, y: Float) {
+        val sx = (x + 8f) * zoom - camX
+        val sy = (y + 8f) * zoom - camY
+        if (sx >= 0f && sx <= width && sy >= 0f && sy <= height) sfx.play(name)
+    }
 
     private fun update(dt: Float) {
         menuT += dt
@@ -429,26 +617,83 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
         separate()
         for (c in castles) if (c.hitTimer > 0f) c.hitTimer -= dt
         val dead = units.filter { it.hp <= 0 }
-        if (dead.isNotEmpty()) units.removeAll(dead)
+        if (dead.isNotEmpty()) {
+            for (d in dead) sfxAt("die", d.x, d.y)
+            units.removeAll(dead)
+        }
+    }
+
+    private fun nearestOre(u: Unit2): Ore? {
+        var best: Ore? = null
+        var bd = Float.MAX_VALUE
+        for (o in ores) {
+            if (o.amount <= 0) continue
+            val d = hypot(o.x - u.x, o.y - u.y)
+            if (d < bd) { bd = d; best = o }
+        }
+        return best
+    }
+
+    private fun removeOre(o: Ore) {
+        ores.remove(o)
+        blocked[idx(o.tx, o.ty)] = false
     }
 
     private fun updateWorker(u: Unit2, dt: Float) {
         val c = castles[u.team]
+        u.repath -= dt
         when (u.job) {
-            1 -> if (!u.moving) { u.job = 2; u.timer = 3f }
+            1 -> {
+                val o = u.tgtOre
+                if (o == null || o.amount <= 0 || !ores.contains(o)) {
+                    val n = nearestOre(u)
+                    if (n == null) { u.job = 0; stop(u) } else moveToOre(u, n)
+                } else if (!u.moving) {
+                    if (rectDist(u, o.x, o.y, 16f, 16f) <= 24f) {
+                        u.job = 2
+                        u.timer = 3f
+                    } else if (u.repath <= 0f) {
+                        moveToOre(u, o)
+                        u.repath = 1f
+                    }
+                }
+            }
             2 -> {
                 u.timer -= dt
                 if (u.timer <= 0f) {
-                    u.carrying = true
-                    u.job = 3
-                    moveTo(u, c.x + 8f, c.y + 24f)
+                    val o = u.tgtOre
+                    var got = false
+                    if (o != null && o.amount > 0) {
+                        o.amount -= 10
+                        got = true
+                        if (o.amount <= 0) removeOre(o)
+                    }
+                    if (got) {
+                        u.carrying = true
+                        u.job = 3
+                        moveTo(u, c.x + 8f, c.y + 24f)
+                    } else {
+                        u.job = 1
+                    }
                 }
             }
             3 -> if (!u.moving) {
-                gold[u.team] += 10
-                u.carrying = false
-                u.job = 1
-                moveTo(u, mineXs[u.team] + 8f, mineYs[u.team] + 24f)
+                if (rectDist(u, c.x, c.y, 32f, 32f) <= 24f) {
+                    gold[u.team] += 10
+                    u.carrying = false
+                    sfxAt("coin", u.x, u.y)
+                    val o = u.tgtOre
+                    val n = if (o != null && o.amount > 0 && ores.contains(o)) o else nearestOre(u)
+                    if (n == null) {
+                        u.job = 0
+                    } else {
+                        u.job = 1
+                        moveToOre(u, n)
+                    }
+                } else if (u.repath <= 0f) {
+                    moveTo(u, c.x + 8f, c.y + 24f)
+                    u.repath = 1f
+                }
             }
         }
     }
@@ -486,11 +731,12 @@ class GameView(context: Context) : SurfaceView(context), SurfaceHolder.Callback,
             val d = hypot(t.x - u.x, t.y - u.y)
             if (d <= 18f) {
                 stop(u)
-if (u.cd <= 0f) {
+                if (u.cd <= 0f) {
                     t.hp -= 8
                     t.hitTimer = 3f
                     u.hitTimer = 3f
                     u.cd = 0.8f
+                    sfxAt(if ((u.x.toInt() + u.y.toInt()) % 2 == 0) "hit" else "hit2", u.x, u.y)
                 }
             } else if (u.repath <= 0f || !u.moving) {
                 moveTo(u, t.x, t.y)
@@ -512,7 +758,11 @@ if (u.cd <= 0f) {
                     c.hitTimer = 3f
                     u.hitTimer = 3f
                     u.cd = 0.8f
-                    if (c.hp <= 0) state = if (c.team == 1) 1 else 2
+                    sfxAt("thud", u.x, u.y)
+                    if (c.hp <= 0) {
+                        state = if (c.team == 1) 1 else 2
+                        sfx.play(if (c.team == 1) "win" else "lose")
+                    }
                 }
             } else if (!u.moving || u.repath <= 0f) {
                 moveTo(u, c.x + 8f, c.y + 34f)
@@ -530,9 +780,10 @@ if (u.cd <= 0f) {
         units.add(u)
         moveTo(u, c.x + 4f + (n % 6) * 12f, c.y + 50f + ((n / 6) % 3) * 16f)
         if (kind == 1 && team == 1) {
-            u.job = 1
-            moveTo(u, mineXs[1] + 8f, mineYs[1] + 24f)
+            val o = nearestOre(u)
+            if (o != null) { u.job = 1; moveToOre(u, o) }
         }
+        if (team == 0) sfx.play("spawn")
         return true
     }
 
@@ -544,8 +795,8 @@ if (u.cd <= 0f) {
         if (workers < 4) train(1, 1, 50) else train(1, 0, 80)
         for (u in units) {
             if (u.team == 1 && u.kind == 1 && u.job == 0 && !u.moving) {
-                u.job = 1
-                moveTo(u, mineXs[1] + 8f, mineYs[1] + 24f)
+                val o = nearestOre(u)
+                if (o != null) { u.job = 1; moveToOre(u, o) }
             }
         }
         val idle = units.filter { it.team == 1 && it.kind == 0 && it.tgtCastle < 0 }
@@ -599,7 +850,6 @@ if (u.cd <= 0f) {
         }
         c.drawRect(0f, 0f, w, h, skyPaint)
 
-        // звёзды
         for (i in 0 until 60) {
             val a = (130 + 120 * sin(menuT * 1.5f + i)).toInt().coerceIn(0, 255)
             fill.color = Color.argb(a, 255, 255, 230)
@@ -608,7 +858,6 @@ if (u.cd <= 0f) {
             c.drawRect(sx, sy, sx + u * 0.6f, sy + u * 0.6f, fill)
         }
 
-        // солнце
         val sr = 12
         val scx = (w * 0.70f / u).toInt()
         val scy = (h * 0.55f / u).toInt()
@@ -622,20 +871,17 @@ if (u.cd <= 0f) {
         val gTop = h * 0.80f
         val cols = (w / u).toInt() + 1
 
-        // дальние горы
         fill.color = Color.rgb(84, 44, 120)
         for (i in 0 until cols) {
             val hh = (10 + 7 * sin(i * 0.09f + 0.5f) + 4 * sin(i * 0.23f + 2f)).toInt().coerceAtLeast(3)
             c.drawRect(i * u, gTop - hh * u, (i + 1) * u, gTop + u, fill)
         }
-        // ближние горы
         fill.color = Color.rgb(44, 26, 84)
         for (i in 0 until cols) {
             val hh = (5 + 4 * sin(i * 0.14f + 3f) + 3 * sin(i * 0.31f)).toInt().coerceAtLeast(2)
             c.drawRect(i * u, gTop - hh * u, (i + 1) * u, gTop + u, fill)
         }
 
-        // облака
         fill.color = Color.argb(150, 255, 190, 205)
         for (k in 0 until 4) {
             val cx = ((menuT * (14f + k * 6f) + k * w / 4f) % (w + 20f * u)) - 10f * u
@@ -645,7 +891,6 @@ if (u.cd <= 0f) {
             c.drawRect(cx + u, cy + u * 2f, cx + u * 7f, cy + u * 3f, fill)
         }
 
-        // земля
         val sp = maxOf(3f, (h / 170f).roundToInt().toFloat())
         val ts = 16f * sp
         var row = 0
@@ -662,7 +907,6 @@ if (u.cd <= 0f) {
             row++
         }
 
-        // замки и деревья
         val base = gTop + ts * 0.9f
         drawSprite(c, castleBlue, w * 0.05f, base - 32f * sp, sp)
         drawSprite(c, castleRed, w * 0.95f - 32f * sp, base - 32f * sp, sp)
@@ -670,7 +914,6 @@ if (u.cd <= 0f) {
             drawSprite(c, tree, w * fx, base - 16f * sp, sp)
         }
 
-        // маршируют солдаты
         val span = w + 400f
         for (i in 0..3) {
             val bx = ((menuT * 70f + i * 150f) % span) - 200f
@@ -706,17 +949,37 @@ if (u.cd <= 0f) {
         textP.color = Color.rgb(255, 225, 240)
         c.drawText("ПИКСЕЛЬНАЯ СТРАТЕГИЯ", w / 2f, h * 0.32f, textP)
 
+        val canContinue = gameActive || hasSave
+        var n = 0
+        if (canContinue) { menuIds[n] = 0; n++ }
+        menuIds[n] = 1; n++
+        menuIds[n] = 2; n++
+        menuIds[n] = 3; n++
+        menuCount = n
+
         val bw = minOf(w * 0.5f, 640f)
-        val bh = (h * 0.135f).coerceIn(80f, 150f)
-        val gap = bh * 0.25f
-        var y = h * 0.37f
-        val labels = arrayOf("ИГРАТЬ", "МУЛЬТИПЛЕЕР", "НАСТРОЙКИ")
-        for (i in 0..2) {
+        val bh = (h * 0.115f).coerceIn(70f, 130f)
+        val gap = bh * 0.22f
+        var y = h * 0.36f
+        for (i in 0 until n) {
             menuBtns[i].set(w / 2f - bw / 2f, y, w / 2f + bw / 2f, y + bh)
-            if (i == 0) pixelButton(c, menuBtns[i], labels[i], bh * 0.42f,
-                Color.rgb(70, 200, 90), Color.rgb(140, 255, 150), Color.rgb(30, 110, 50))
-            else pixelButton(c, menuBtns[i], labels[i], bh * 0.40f,
-                Color.rgb(90, 110, 200), Color.rgb(150, 170, 255), Color.rgb(45, 55, 120))
+            val id = menuIds[i]
+            val label = when (id) {
+                0 -> "ПРОДОЛЖИТЬ"
+                1 -> if (canContinue) "НОВАЯ ИГРА" else "ИГРАТЬ"
+                2 -> "МУЛЬТИПЛЕЕР"
+                else -> "НАСТРОЙКИ"
+            }
+            if (id == 0 || (id == 1 && !canContinue)) {
+                pixelButton(c, menuBtns[i], label, bh * 0.42f,
+                    Color.rgb(70, 200, 90), Color.rgb(140, 255, 150), Color.rgb(30, 110, 50))
+            } else if (id == 1) {
+                pixelButton(c, menuBtns[i], label, bh * 0.40f,
+                    Color.rgb(230, 150, 60), Color.rgb(255, 200, 120), Color.rgb(140, 80, 30))
+            } else {
+                pixelButton(c, menuBtns[i], label, bh * 0.40f,
+                    Color.rgb(90, 110, 200), Color.rgb(150, 170, 255), Color.rgb(45, 55, 120))
+            }
             y += bh + gap
         }
     }
@@ -778,16 +1041,27 @@ if (u.cd <= 0f) {
         for (ty in y0..y1) for (tx in x0..x1) {
             if (trees[ty][tx]) c.drawBitmap(tree, (tx * tile).toFloat(), (ty * tile).toFloat(), paint)
         }
-        for (i in 0..1) c.drawBitmap(mine, mineXs[i], mineYs[i], paint)
+        for (o in ores) {
+            if (o.tx in x0..x1 && o.ty in y0..y1) c.drawBitmap(oreBmp, o.x, o.y, paint)
+        }
         c.drawBitmap(castleBlue, castles[0].x, castles[0].y, paint)
         c.drawBitmap(castleRed, castles[1].x, castles[1].y, paint)
         if (menuOpen) ring(c, tgtPaint, castles[0].x + 16f, castles[0].y + 28f, 18f, 6f)
 
+        // одна общая точка для отряда
+        var heading = false
         for (u in units) {
-            if (u.selected && u.moving && u.job == 0 && u.tgtUnit == null) {
-                ring(c, tgtPaint, u.goalX + 8f, u.goalY + 14f, 3f, 1.5f)
+            if (u.team == 0 && u.moving && u.job == 0 && u.tgtUnit == null && u.tgtCastle < 0 &&
+                hypot(u.goalX + 8f - markX, u.goalY + 8f - markY) < 20f) {
+                heading = true
+                break
             }
         }
+        if (heading) {
+            ring(c, tgtPaint, markX, markY + 4f, 6f, 3f)
+            c.drawRect(markX - 1f, markY + 3f, markX + 1f, markY + 5f, goldDot)
+        }
+
         for (u in units.sortedBy { it.y }) {
             val sx = u.x.roundToInt().toFloat()
             val sy = u.y.roundToInt().toFloat()
@@ -818,7 +1092,6 @@ if (u.cd <= 0f) {
         val w = width.toFloat()
         val h = height.toFloat()
 
-        // золото
         c.drawRect(0f, 0f, 330f, 70f, hudBg)
         c.drawCircle(36f, 35f, 14f, goldDot)
         hudText.textAlign = Paint.Align.LEFT
@@ -831,11 +1104,10 @@ if (u.cd <= 0f) {
             hudText.textSize = 40f
         }
 
-        // кнопки справа
         val bw = 250f
         val bh = 76f
         val left = w - 24f - bw
-        for (i in 0..2) btnHud[i].set(left, 24f + i * (bh + 14f), left + bw, 24f + i * (bh + 14f) + bh)
+        for (i in 0..3) btnHud[i].set(left, 24f + i * (bh + 14f), left + bw, 24f + i * (bh + 14f) + bh)
         pixelButton(c, btnHud[0], "Меню", 32f,
             Color.rgb(110, 120, 160), Color.rgb(170, 180, 220), Color.rgb(60, 66, 100))
         pixelButton(c, btnHud[1], "Снять выделение", 26f,
@@ -844,8 +1116,11 @@ if (u.cd <= 0f) {
             Color.rgb(80, 200, 100), Color.rgb(150, 255, 160), Color.rgb(40, 110, 55))
         else pixelButton(c, btnHud[2], "Рамка", 32f,
             Color.rgb(80, 110, 200), Color.rgb(140, 170, 255), Color.rgb(40, 55, 120))
+        if (sfx.enabled) pixelButton(c, btnHud[3], "Звук: ВКЛ", 30f,
+            Color.rgb(110, 120, 160), Color.rgb(170, 180, 220), Color.rgb(60, 66, 100))
+        else pixelButton(c, btnHud[3], "Звук: ВЫКЛ", 30f,
+            Color.rgb(90, 90, 90), Color.rgb(140, 140, 140), Color.rgb(50, 50, 50))
 
-        // ползунок зума
         val top = sliderTop()
         val bot = sliderBot()
         fill.color = Color.argb(170, 20, 20, 30)
@@ -867,7 +1142,6 @@ if (u.cd <= 0f) {
         c.drawText("+", 56f, top - 22f, textP)
         c.drawText("-", 56f, bot + 56f, textP)
 
-        // рамка выделения
         if (selecting) {
             val l = minOf(downX, lastX)
             val r = maxOf(downX, lastX)
@@ -939,21 +1213,27 @@ if (u.cd <= 0f) {
     }
 
     private fun hudButtonAt(x: Float, y: Float): Int {
-        for (i in 0..2) if (btnHud[i].contains(x, y)) return i
+        for (i in 0..3) if (btnHud[i].contains(x, y)) return i
         return -1
     }
 
     private fun say(t: String) { msg = t; msgTime = 2f }
 
     private fun hudAction(b: Int) {
+        sfx.play("click")
         when (b) {
-            0 -> screenState = 0
+            0 -> { saveGame(); screenState = 0 }
             1 -> {
                 for (u in units) u.selected = false
                 menuOpen = false
                 rectMode = false
             }
             2 -> rectMode = !rectMode
+            3 -> {
+                val on = !sfx.enabled
+                sfx.setSound(on)
+                prefs.edit().putBoolean("sound", on).apply()
+            }
         }
     }
 
@@ -1006,35 +1286,47 @@ if (u.cd <= 0f) {
             return
         }
         val mc = castles[0]
-    if (wx >= mc.x && wx <= mc.x + 32 && wy >= mc.y && wy <= mc.y + 32) {
+        if (wx >= mc.x && wx <= mc.x + 32 && wy >= mc.y && wy <= mc.y + 32) {
             menuOpen = !menuOpen
             return
         }
         menuOpen = false
-        if (wx >= mineXs[0] && wx <= mineXs[0] + 32 && wy >= mineYs[0] && wy <= mineYs[0] + 32) {
+        val oreHit = ores.firstOrNull {
+            wx >= it.x && wx <= it.x + 16 && wy >= it.y && wy <= it.y + 16
+        }
+        if (oreHit != null) {
             var k = 0
             for (u in sel) if (u.kind == 1) {
                 u.job = 1; u.carrying = false
                 u.tgtUnit = null; u.tgtCastle = -1
-                moveTo(u, mineXs[0] + 8f + k * 3f, mineYs[0] + 24f)
+                moveToOre(u, oreHit)
                 k++
             }
             if (k > 0) return
         }
-        for ((i, u) in sel.withIndex()) {
-            val col = i % 4
-            val row = i / 4
-            u.job = 0; u.carrying = false
-            u.tgtUnit = null; u.tgtCastle = -1
-            moveTo(u, wx - 8f + (col - 1.5f) * 18f, wy - 14f + row * 18f)
+        if (sel.isNotEmpty()) {
+            markX = wx
+            markY = wy
+            for (u in sel) {
+                u.job = 0; u.carrying = false
+                u.tgtUnit = null; u.tgtCastle = -1; u.tgtOre = null
+                moveTo(u, wx - 8f, wy - 8f)
+            }
         }
     }
 
     private fun menuTap(x: Float, y: Float) {
-        when {
-            menuBtns[0].contains(x, y) -> startGame()
-            menuBtns[1].contains(x, y) -> { stubTitle = "МУЛЬТИПЛЕЕР"; screenState = 2 }
-            menuBtns[2].contains(x, y) -> { stubTitle = "НАСТРОЙКИ"; screenState = 2 }
+        for (i in 0 until menuCount) {
+            if (menuBtns[i].contains(x, y)) {
+                sfx.play("click")
+                when (menuIds[i]) {
+                    0 -> continueGame()
+                    1 -> startGame()
+                    2 -> { stubTitle = "МУЛЬТИПЛЕЕР"; screenState = 2 }
+                    3 -> { stubTitle = "НАСТРОЙКИ"; screenState = 2 }
+                }
+                return
+            }
         }
     }
 
@@ -1089,10 +1381,10 @@ if (u.cd <= 0f) {
                 val y = e.y
                 when (screenState) {
                     0 -> actions.add { menuTap(x, y) }
-                    2 -> actions.add { if (backBtn.contains(x, y)) screenState = 0 }
+                    2 -> actions.add { if (backBtn.contains(x, y)) { sfx.play("click"); screenState = 0 } }
                     else -> {
                         if (state != 0) {
-                            actions.add { screenState = 0 }
+                            actions.add { endGameToMenu() }
                         } else if (touchMode == 2) {
                             val b = pressedBtn
                             if (hudButtonAt(x, y) == b && b >= 0) actions.add { hudAction(b) }
@@ -1125,71 +1417,6 @@ if (u.cd <= 0f) {
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {}
-
-    private fun tryMove(u: Unit2, mx: Float, my: Float) {
-        val nx = u.x + mx
-        val ny = u.y + my
-        if (!blockedBox(nx + 8f, ny + 8f, 5f)) { u.x = nx; u.y = ny; return }
-        if (!blockedBox(nx + 8f, u.y + 8f, 5f)) { u.x = nx; return }
-        if (!blockedBox(u.x + 8f, ny + 8f, 5f)) { u.y = ny }
-    }
-
-    private fun moveUnit(u: Unit2, dt: Float) {
-        if (!u.moving) { u.stuckT = 0f; return }
-        val tx = u.path[u.pi * 2]
-        val ty = u.path[u.pi * 2 + 1]
-        val ddx = tx - u.x
-        val ddy = ty - u.y
-        val d = hypot(ddx, ddy)
-        val step = speed * dt
-        val isLast = u.pi * 2 + 2 >= u.path.size
-        if (d <= step || (!isLast && d < 3f)) {
-            u.x = tx
-            u.y = ty
-            u.pi++
-            if (!u.moving) { u.path.clear(); u.pi = 0 }
-            u.stuckT = 0f
-            u.lastPx = u.x
-            u.lastPy = u.y
-            return
-        }
-        val dx = ddx / d
-        val dy = ddy / d
-        var ax = 0f
-        var ay = 0f
-        for (o in units) {
-            if (o === u || o.hp <= 0) continue
-            val ox = o.x - u.x
-            val oy = o.y - u.y
-            val od = hypot(ox, oy)
-            if (od > 22f || od < 0.01f) continue
-            val dot = (ox * dx + oy * dy) / od
-            if (dot < 0.2f) continue
-            val cross = dx * oy - dy * ox
-            val sx: Float
-            val sy: Float
-            if (cross < -2f) { sx = -dy; sy = dx } else { sx = dy; sy = -dx }
-            val w = (22f - od) / 22f * dot * 1.6f
-            ax += sx * w
-            ay += sy * w
-        }
-        var fx = dx + ax
-        var fy = dy + ay
-        val fl = hypot(fx, fy)
-        if (fl > 0.01f) { fx /= fl; fy /= fl } else { fx = dx; fy = dy }
-        tryMove(u, fx * step, fy * step)
-        u.stuckT += dt
-        if (u.stuckT >= 0.5f) {
-            val moved = hypot(u.x - u.lastPx, u.y - u.lastPy)
-            u.lastPx = u.x
-            u.lastPy = u.y
-            u.stuckT = 0f
-            if (moved < 5f) {
-                if (hypot(u.goalX - u.x, u.goalY - u.y) < 40f) stop(u)
-                else moveTo(u, u.goalX, u.goalY)
-            }
-        }
-    }
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
         minZoom = maxOf(w.toFloat() / (mapW * tile), h.toFloat() / (mapH * tile))
         zoom = zoom.coerceIn(minZoom, maxZoom)
